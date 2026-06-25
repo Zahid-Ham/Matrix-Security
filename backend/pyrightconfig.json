@@ -1,0 +1,35 @@
+{
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "."
+  ],
+  "extraPaths": [
+    "."
+  ],
+  "typeCheckingMode": "off",
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "reportGeneralTypeIssues": false,
+  "reportAttributeAccessIssue": false,
+  "reportOperatorIssue": false,
+  "reportReturnType": false,
+  "reportArgumentType": false,
+  "reportAssignmentType": false,
+  "reportIndexIssue": false,
+  "reportCallIssue": false,
+  "reportOptionalCall": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalSubscript": false,
+  "reportPrivateImportUsage": false,
+  "reportIncompatibleMethodOverride": false,
+  "reportIncompatibleVariableOverride": false,
+  "reportOverlappingOverload": false,
+  "reportUninitializedInstanceVariable": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false
+}

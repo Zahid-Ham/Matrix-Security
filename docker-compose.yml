@@ -1,0 +1,103 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: matrix-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-matrix}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-matrix_secure_pass}
+      POSTGRES_DB: ${DB_NAME:-matrix}
+    ports:
+      - "5432:5432"
+    networks:
+      - matrix-net
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U matrix" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: matrix-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - matrix-net
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    container_name: matrix-backend
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER:-matrix}:${DB_PASSWORD:-matrix_secure_pass}@postgres:5432/${DB_NAME:-matrix}
+      - REDIS_URL=redis://redis:6379
+      - PORT=8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - matrix-net
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - NEXT_PUBLIC_API_URL=
+    container_name: matrix-frontend
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=
+      - BACKEND_URL=http://backend:8000
+    networks:
+      - matrix-net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+networks:
+  matrix-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

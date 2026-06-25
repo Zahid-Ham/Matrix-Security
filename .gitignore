@@ -1,0 +1,43 @@
+# Python
+venv/
+backend/venv/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+backend/.env
+.env.local
+.env.*
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Builds
+.next/
+frontend/.next/
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+
+# Logs
+*.log
+logs/
+
+backend/tests/unit/test_github_agent.py
+
+matrix-vulnerable-demo/
+
+*.txt
+backend/artifacts_debug.json
+backend/security_report.json
+backend/api_response_42.json
+backend/benchmark_results.json
