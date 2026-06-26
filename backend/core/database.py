@@ -1,0 +1,636 @@
+"""
+Database configuration and session management.
+
+This module provides async SQLAlchemy configuration with connection pooling,
+session management, and database initialization utilities for the Matrix
+security scanner.
+"""
+from typing import AsyncGenerator, Optional, List, Any
+from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    AsyncSession,
+    AsyncEngine,
+    async_sessionmaker
+)
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import event, text
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from config import get_settings
+from core.logger import get_logger
+
+# Initialize structured logger
+logger = get_logger(__name__)
+
+# Load application settings
+settings = get_settings()
+
+# Database configuration constants
+DB_POOL_SIZE = 5
+DB_MAX_OVERFLOW = 10
+DB_POOL_TIMEOUT = 30
+DB_POOL_RECYCLE = 3600  # 1 hour
+DB_ECHO_ENABLED = settings.debug
+
+
+class DatabaseConfig:
+    """
+    Centralized database configuration and engine management.
+    
+    This class encapsulates all database-related configuration and provides
+    utilities for engine management, connection testing, and monitoring.
+    """
+    
+    def __init__(self) -> None:
+        """Initialize database configuration without creating engine immediately."""
+        self.engine: Optional[AsyncEngine] = None
+        self.session_maker: Optional[async_sessionmaker] = None
+        # Engine will be initialized lazily or manually via initialize_engine()
+    
+    def initialize_engine(self) -> None:
+        """Create and configure the async database engine."""
+        if self.engine:
+            return
+            
+        try:
+            # Ensure the database URL uses an async driver for PostgreSQL
+            db_url = settings.database_url
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+                logger.info("Automatically added +asyncpg to DATABASE_URL for compatibility")
+            
+            logger.info(f"Initializing database engine: {self._get_safe_url(db_url)}")
+            
+            # Determine if using SQLite (doesn't support pooling args)
+            is_sqlite = "sqlite" in db_url.lower()
+            
+            # Engine configuration - SQLite doesn't support pool settings
+            engine_args: dict[str, Any] = {
+                "echo": DB_ECHO_ENABLED,
+                "future": True,
+            }
+            
+            if not is_sqlite:
+                # PostgreSQL/MySQL pooling configuration
+                engine_args.update({
+                    "pool_size": DB_POOL_SIZE,
+                    "max_overflow": DB_MAX_OVERFLOW,
+                    "pool_timeout": DB_POOL_TIMEOUT,
+                    "pool_recycle": DB_POOL_RECYCLE,
+                    "pool_pre_ping": True,  # Verify connections before using
+                })
+            
+            self.engine = create_async_engine(
+                db_url,
+                **engine_args
+            )
+            
+            # Configure SQLite-specific optimizations
+            if is_sqlite:
+                self._configure_sqlite_optimizations()
+
+            
+            # Create session factory
+            self.session_maker = async_sessionmaker(
+                self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+            )
+            
+            logger.info("Database engine initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize database engine: {str(e)}", exc_info=True)
+            raise
+
+    async def force_dispose(self) -> None:
+        """Force dispose of current engine to allow re-initialization in new loop."""
+        if self.engine:
+            await self.engine.dispose()
+            self.engine = None
+            self.session_maker = None
+            logger.info("Database engine forced to dispose")
+    
+    def _configure_sqlite_optimizations(self) -> None:
+        """Configure SQLite-specific performance optimizations."""
+        logger.info("Configuring SQLite optimizations (WAL mode, synchronous=NORMAL)")
+        
+        @event.listens_for(self.engine.sync_engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            """Set SQLite PRAGMAs for optimal performance."""
+            cursor = dbapi_connection.cursor()
+            try:
+                # Enable WAL mode for better concurrency
+                cursor.execute("PRAGMA journal_mode=WAL")
+                
+                # Optimize for speed while maintaining safety
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                
+                # Cache size (negative value = KB, -64000 = 64MB)
+                cursor.execute("PRAGMA cache_size=-64000")
+                
+                # Enable foreign key constraints
+                cursor.execute("PRAGMA foreign_keys=ON")
+                
+                logger.debug("SQLite PRAGMAs configured successfully")
+            except Exception as e:
+                logger.error(f"Failed to set SQLite PRAGMAs: {str(e)}")
+            finally:
+                cursor.close()
+    
+    def _get_safe_url(self, url: Optional[str] = None) -> str:
+        """
+        Get database URL with credentials masked for logging.
+        
+        Args:
+            url: Optional URL to mask. If not provided, uses settings.database_url.
+            
+        Returns:
+            Database URL with password replaced by asterisks.
+        """
+        if url is None:
+            url = settings.database_url
+            
+        if "@" in url:
+            # Mask password in URL (e.g., postgresql://user:***@host/db)
+            parts = url.split("@")
+            if ":" in parts[0]:
+                user_part = parts[0].split(":")[0]
+                return f"{user_part}:***@{parts[1]}"
+        return url
+    
+    async def get_connection_pool_status(self) -> dict:
+        """
+        Get current connection pool statistics.
+        
+        Returns:
+            Dictionary containing pool size, checked out connections, etc.
+        """
+        if not self.engine:
+            return {"error": "Engine not initialized"}
+        
+        pool = self.engine.pool
+        return {
+            "size": pool.size(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+            "total_connections": pool.size() + pool.overflow(),
+        }
+    
+    async def health_check(self) -> bool:
+        """
+        Perform a database health check.
+        
+        Returns:
+            True if database is accessible and responding, False otherwise.
+        """
+        if not self.engine:
+            logger.error("Health check failed: Engine not initialized")
+            return False
+        
+        try:
+            async with self.engine.begin() as conn:
+                result = await conn.execute(text("SELECT 1"))
+                result.fetchone()
+            logger.debug("Database health check passed")
+            return True
+        except OperationalError as e:
+            logger.error(f"Database health check failed: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during health check: {str(e)}", exc_info=True)
+            return False
+    
+    async def dispose(self) -> None:
+        """Dispose of the database engine and close all connections."""
+        if self.engine:
+            logger.info("Disposing database engine and closing connections")
+            await self.engine.dispose()
+            logger.info("Database engine disposed successfully")
+
+
+# Global database configuration instance
+db_config = DatabaseConfig()
+
+# Expose properties that always check initialization
+def get_engine() -> AsyncEngine:
+    if db_config.engine is None:
+        db_config.initialize_engine()
+    return db_config.engine
+
+def get_session_maker() -> async_sessionmaker:
+    if db_config.session_maker is None:
+        db_config.initialize_engine()
+    return db_config.session_maker
+
+# For backward compatibility, but use with caution in multi-loop environments
+# We'll use a trick to make them behave like the current engine/session_maker
+class LazyGlobal:
+    def __init__(self, func):
+        self.func = func
+    def __getattr__(self, name):
+        return getattr(self.func(), name)
+    def __call__(self, *args, **kwargs):
+        return self.func()(*args, **kwargs)
+
+engine = LazyGlobal(get_engine)
+async_session_maker = LazyGlobal(get_session_maker)
+
+
+class Base(DeclarativeBase):
+    """
+    Base class for all database models.
+    
+    All SQLAlchemy models should inherit from this class to ensure
+    proper table creation and metadata management.
+    """
+    pass
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Dependency for getting database sessions with automatic transaction management.
+    
+    This generator provides a database session that automatically commits on success
+    and rolls back on exceptions. It should be used with FastAPI's Depends() or
+    similar dependency injection systems.
+    
+    Yields:
+        AsyncSession: An async SQLAlchemy session.
+        
+    Raises:
+        SQLAlchemyError: If there's an error during session operations.
+        
+    Example:
+        ```python
+        @app.get("/users")
+        async def get_users(db: AsyncSession = Depends(get_db)):
+            result = await db.execute(select(User))
+            return result.scalars().all()
+        ```
+    """
+    if not async_session_maker:
+        logger.error("Session maker not initialized")
+        raise RuntimeError("Database session maker not initialized")
+    
+    async with async_session_maker() as session:
+        try:
+            logger.debug("Database session created")
+            yield session
+            await session.commit()
+            logger.debug("Database transaction committed")
+        except SQLAlchemyError as e:
+            await session.rollback()
+            logger.error(f"Database error, transaction rolled back: {str(e)}")
+            raise
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Unexpected error, transaction rolled back: {str(e)}", exc_info=True)
+            raise
+        finally:
+            await session.close()
+            logger.debug("Database session closed")
+
+
+@asynccontextmanager
+async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Context manager for getting database sessions in non-FastAPI contexts.
+    
+    This provides the same functionality as get_db() but as a context manager
+    for use outside of FastAPI dependency injection.
+    
+    Yields:
+        AsyncSession: An async SQLAlchemy session.
+        
+    Example:
+        ```python
+        async with get_db_context() as db:
+            result = await db.execute(select(User))
+            users = result.scalars().all()
+        ```
+    """
+    async for session in get_db():
+        yield session
+
+
+async def init_db() -> None:
+    """
+    Initialize database tables based on defined models.
+    
+    This function creates all tables defined in SQLAlchemy models that inherit
+    from Base. It should be called during application startup.
+    
+    Raises:
+        SQLAlchemyError: If table creation fails.
+    """
+    if not engine:
+        logger.error("Cannot initialize database: Engine not initialized")
+        raise RuntimeError("Database engine not initialized")
+    
+    try:
+        logger.info("Initializing database tables...")
+        
+        async with engine.begin() as conn:
+            # Get list of tables to create
+            table_names = list(Base.metadata.tables.keys())
+            
+            if not table_names:
+                logger.warning("No tables defined in Base.metadata")
+            else:
+                logger.info(f"Creating {len(table_names)} tables: {', '.join(table_names)}")
+            
+            # Create all tables
+            await conn.run_sync(Base.metadata.create_all)
+            
+            # Auto-migrate schema fixes for existing tables
+            await _check_and_apply_migrations(conn)
+            
+        logger.info("Database tables initialized successfully")
+        
+        # Seed marketplace data if empty
+        await _seed_marketplace_data()
+        
+        # Perform health check after initialization
+        is_healthy = await db_config.health_check()
+        if is_healthy:
+            logger.info("Database health check passed")
+        else:
+            logger.warning("Database health check failed after initialization")
+            
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to initialize database tables: {str(e)}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during database initialization: {str(e)}", exc_info=True)
+        raise
+
+
+
+async def _check_and_apply_migrations(conn) -> None:
+    """
+    Check for missing columns and apply migrations manually.
+    This handles schema updates for environments without Alembic.
+    """
+    try:
+        # Check for custom_headers
+        # Note: information_schema checks work for Postgres. For SQLite we'd need pragma_table_info.
+        if "sqlite" in settings.database_url:
+            # Simple SQLite check/add
+            try:
+                await conn.execute(text("ALTER TABLE scans ADD COLUMN custom_headers JSON"))
+                logger.info("Migrated SQLite: Added custom_headers")
+            except Exception:
+                pass # Column likely exists
+                
+            try:
+                await conn.execute(text("ALTER TABLE scans ADD COLUMN custom_cookies JSON"))
+                logger.info("Migrated SQLite: Added custom_cookies")
+            except Exception:
+                pass # Column likely exists
+            
+            try:
+                await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN threat_intelligence JSON"))
+                logger.info("Migrated SQLite: Added threat_intelligence")
+            except Exception:
+                pass # Column likely exists
+
+            try:
+                await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN marketplace_value_avg FLOAT"))
+                logger.info("Migrated SQLite: Added marketplace_value_avg")
+            except Exception:
+                pass # Column likely exists
+
+            try:
+                await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN marketplace_last_analyzed DATETIME"))
+                logger.info("Migrated SQLite: Added marketplace_last_analyzed")
+            except Exception:
+                pass # Column likely exists
+        else:
+            # Postgres Migration
+            result = await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='scans' AND column_name='custom_headers'"
+            ))
+            if not result.scalar():
+                logger.info("Migrating schema: Adding 'custom_headers' to 'scans' table")
+                await conn.execute(text("ALTER TABLE scans ADD COLUMN custom_headers JSONB"))
+                
+            result = await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='scans' AND column_name='custom_cookies'"
+            ))
+            if not result.scalar():
+                logger.info("Migrating schema: Adding 'custom_cookies' to 'scans' table")
+                await conn.execute(text("ALTER TABLE scans ADD COLUMN custom_cookies JSONB"))
+            
+            result = await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='vulnerabilities' AND column_name='threat_intelligence'"
+            ))
+            if not result.scalar():
+                logger.info("Migrating schema: Adding 'threat_intelligence' to 'vulnerabilities' table")
+                await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN threat_intelligence JSONB"))
+
+            result = await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='vulnerabilities' AND column_name='marketplace_value_avg'"
+            ))
+            if not result.scalar():
+                logger.info("Migrating schema: Adding 'marketplace_value_avg' to 'vulnerabilities' table")
+                await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN marketplace_value_avg DOUBLE PRECISION"))
+
+            result = await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='vulnerabilities' AND column_name='marketplace_last_analyzed'"
+            ))
+            if not result.scalar():
+                logger.info("Migrating schema: Adding 'marketplace_last_analyzed' to 'vulnerabilities' table")
+                await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN marketplace_last_analyzed TIMESTAMP WITH TIME ZONE"))
+                
+    except Exception as e:
+        # Don't fail startup if migration fails - might trigger other issues but keep app alive
+        logger.error(f"Migration check warning: {e}")
+
+
+
+async def _seed_marketplace_data() -> None:
+    """Seed exploit pricing and financial impact data if they are empty."""
+    from sqlalchemy import select, func
+
+    try:
+        # Import dynamically to prevent circular dependencies
+        from marketplace_simulation.models import ExploitPricing, FinancialImpact
+
+        async with async_session_maker() as session:
+            # Check if exploit pricing is empty
+            exploit_count_stmt = select(func.count(ExploitPricing.id))
+            result = await session.execute(exploit_count_stmt)
+            exploit_count = result.scalar() or 0
+
+            # Check if financial impact is empty
+            finance_count_stmt = select(func.count(FinancialImpact.id))
+            result = await session.execute(finance_count_stmt)
+            finance_count = result.scalar() or 0
+
+            if exploit_count == 0 or finance_count == 0:
+                logger.info("Marketplace seed data is missing. Running auto-seeding...")
+                from marketplace_simulation.utils.data_importer import import_exploit_pricing, import_financial_impact
+                from pathlib import Path
+
+                backend_dir = Path(__file__).parent.parent
+                dark_csv = backend_dir / "marketplace_simulation" / "data" / "dark.csv"
+                finance_csv = backend_dir / "marketplace_simulation" / "data" / "finance.csv"
+
+                if exploit_count == 0 and dark_csv.exists():
+                    logger.info(f"Auto-importing exploit pricing from {dark_csv}")
+                    await import_exploit_pricing(str(dark_csv))
+
+                if finance_count == 0 and finance_csv.exists():
+                    logger.info(f"Auto-importing financial impact from {finance_csv}")
+                    await import_financial_impact(str(finance_csv))
+
+    except Exception as e:
+        logger.error(f"Failed to auto-seed marketplace data: {e}", exc_info=True)
+
+    # After seeding pricing data, backfill any vulnerabilities that lack valuations.
+    # This ensures production DB is populated on every server startup.
+    import asyncio
+    asyncio.ensure_future(_backfill_missing_valuations())
+
+
+async def _backfill_missing_valuations() -> None:
+    """
+    Background task: run MarketplaceService.analyze_vulnerability for every vulnerability
+    that does not yet have a marketplace_value_avg set. Safe to call on every startup —
+    it only processes vulnerabilities that haven't been valued yet.
+    """
+    try:
+        from sqlalchemy import select
+        from models.vulnerability import Vulnerability
+        from marketplace_simulation.services.marketplace_service import MarketplaceService
+
+        async with async_session_maker() as session:
+            stmt = select(Vulnerability).where(Vulnerability.marketplace_value_avg.is_(None))
+            result = await session.execute(stmt)
+            unanalyzed = result.scalars().all()
+
+        if not unanalyzed:
+            logger.info("Auto-backfill: all vulnerabilities already have valuations.")
+            return
+
+        logger.info(f"Auto-backfill: found {len(unanalyzed)} unanalyzed vulnerabilities. Starting valuation...")
+        count = 0
+        for vuln in unanalyzed:
+            # Use a fresh session per vulnerability to keep transactions clean
+            async with async_session_maker() as val_session:
+                try:
+                    await MarketplaceService.analyze_vulnerability(int(vuln.id), val_session)  # type: ignore
+                    count += 1
+                except Exception as ve:
+                    logger.warning(f"Auto-backfill: failed for vuln {vuln.id}: {ve}")
+
+        logger.info(f"Auto-backfill complete: {count}/{len(unanalyzed)} vulnerabilities analyzed and valued.")
+
+    except Exception as e:
+        logger.error(f"Auto-backfill failed: {e}", exc_info=True)
+
+
+
+async def close_db() -> None:
+    """
+    Close database connections and dispose of the engine.
+    
+    This function should be called during application shutdown to ensure
+    all database connections are properly closed.
+    """
+    try:
+        await db_config.dispose()
+    except Exception as e:
+        logger.error(f"Error closing database: {str(e)}", exc_info=True)
+        raise
+
+
+async def get_table_info() -> List[dict]:
+    """
+    Get information about all database tables.
+    
+    Returns:
+        List of dictionaries containing table names and column information.
+        
+    Example:
+        ```python
+        tables = await get_table_info()
+        for table in tables:
+            print(f"Table: {table['name']}, Columns: {table['columns']}")
+        ```
+    """
+    if not engine:
+        logger.error("Cannot get table info: Engine not initialized")
+        return []
+    
+    tables_info = []
+    
+    for table_name, table in Base.metadata.tables.items():
+        columns = [
+            {
+                "name": column.name,
+                "type": str(column.type),
+                "nullable": column.nullable,
+                "primary_key": column.primary_key,
+            }
+            for column in table.columns
+        ]
+        
+        tables_info.append({
+            "name": table_name,
+            "columns": columns,
+            "column_count": len(columns),
+        })
+    
+    logger.debug(f"Retrieved info for {len(tables_info)} tables")
+    return tables_info
+
+
+async def drop_all_tables() -> None:
+    """
+    Drop all database tables.
+    
+    WARNING: This will permanently delete all data. Use only for testing
+    or development environments.
+    
+    Raises:
+        SQLAlchemyError: If table deletion fails.
+    """
+    if not engine:
+        logger.error("Cannot drop tables: Engine not initialized")
+        raise RuntimeError("Database engine not initialized")
+    
+    logger.warning("Dropping all database tables - THIS WILL DELETE ALL DATA")
+    
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        logger.warning("All database tables dropped successfully")
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to drop tables: {str(e)}", exc_info=True)
+        raise
+
+
+async def vacuum_database() -> None:
+    """
+    Vacuum the SQLite database to reclaim space and optimize performance.
+    
+    This is only applicable for SQLite databases. For other databases,
+    this function will log a warning and return.
+    """
+    if not engine:
+        logger.error("Cannot vacuum: Engine not initialized")
+        return
+    
+    if "sqlite" not in settings.database_url.lower():
+        logger.info("VACUUM command only applicable to SQLite databases")
+        return
+    
+    try:
+        logger.info("Running VACUUM on SQLite database...")
+        async with engine.begin() as conn:
+            await conn.execute(text("VACUUM"))
+        logger.info("Database VACUUM completed successfully")
+    except Exception as e:
+        logger.error(f"Failed to vacuum database: {str(e)}", exc_info=True)
