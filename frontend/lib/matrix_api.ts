@@ -1,0 +1,601 @@
+/**
+ * API client for Matrix backend
+ */
+
+declare let process: any;
+
+let API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
+
+if (typeof window !== 'undefined') {
+    console.log('[API] Browser environment detected.');
+    console.log('[API] Raw process.env.NEXT_PUBLIC_API_URL:', process.env.NEXT_PUBLIC_API_URL);
+    console.log('[API] Initial API_BASE:', API_BASE);
+
+    // Unconditionally force relative paths in browser to leverage Next.js rewrites/proxy and ensure same-origin cookies
+    API_BASE = '';
+    console.log('[API] Final API_BASE used for requests:', API_BASE);
+}
+
+interface ApiError {
+    detail: string;
+}
+
+export class MatrixApiClient {
+    // No explicit token management needed - handled by HttpOnly cookies
+
+    // Helper to get cookie by name
+    private getCookie(name: string): string | null {
+        if (typeof document === 'undefined') return null;
+
+        // More robust cookie parsing
+        const cookies = document.cookie.split(';');
+        for (let cookie of cookies) {
+            const [cookieName, cookieValue] = cookie.split('=').map(c => c.trim());
+            if (cookieName === name) {
+                console.log(`[API] Found cookie ${name}:`, cookieValue?.substring(0, 10) + '...');
+                return cookieValue || null;
+            }
+        }
+        console.log(`[API] Cookie ${name} not found. Available cookies:`, document.cookie);
+        return null;
+    }
+
+    private extractErrorMessage(errorData: any, status: number): string {
+        let message: string;
+        if (typeof errorData.detail === 'string') {
+            message = errorData.detail;
+        } else if (typeof errorData.detail === 'object' && errorData.detail !== null) {
+            message = JSON.stringify(errorData.detail);
+        } else if (errorData.message) {
+            message = errorData.message;
+        } else if (errorData.error) {
+            message = typeof errorData.error === 'string' ? errorData.error : JSON.stringify(errorData.error);
+        } else {
+            message = `HTTP error ${status}`;
+        }
+
+        if (message === 'Could not validate credentials' || status === 401) {
+            return 'Session expired. Please log in again.';
+        }
+        return message;
+    }
+
+    private async request<T>(
+        endpoint: string,
+        options: RequestInit = {}
+    ): Promise<T> {
+        const headers: HeadersInit = {
+            'Content-Type': 'application/json',
+            ...options.headers,
+        };
+
+        // Inject Authorization header if token is available in memory
+        if (this.accessToken) {
+            (headers as any)['Authorization'] = `Bearer ${this.accessToken}`;
+        }
+
+        // Inject CSRF Token from memory (fallback to cookie)
+        const csrfToken = this.csrfToken || this.getCookie('CSRF-TOKEN');
+        if (csrfToken) {
+            console.log('[API] CSRF Token found, injecting into headers');
+            (headers as any)['X-CSRF-Token'] = csrfToken;
+        } else {
+            if (options.method && options.method !== 'GET') {
+                console.warn('[API] WARNING: No CSRF token found for unsafe request:', endpoint);
+            }
+        }
+
+        try {
+            const response = await fetch(`${API_BASE}${endpoint}`, {
+                ...options,
+                headers,
+                credentials: 'include', // CRITICAL: Send cookies
+                cache: 'no-store', // Disable caching to ensure fresh scan data
+            });
+
+            // Handle 401 Unauthorized (Token Expired?)
+            if (response.status === 401 && !endpoint.includes('/auth/login')) {
+                // Attempt refresh
+                try {
+                    const refreshResponse = await fetch(`${API_BASE}/api/auth/refresh/`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-Token': this.getCookie('CSRF-TOKEN') || ''
+                        },
+                        credentials: 'include',
+                    });
+
+                    if (refreshResponse.ok) {
+                        // Retry original request with same headers (which include CSRF)
+                        const retryResponse = await fetch(`${API_BASE}${endpoint}`, {
+                            ...options,
+                            headers,
+                            credentials: 'include',
+                        });
+
+                        if (!retryResponse.ok) {
+                            const errorData = await retryResponse.json().catch(() => ({ detail: 'Unknown error' }));
+                            throw new Error(this.extractErrorMessage(errorData, retryResponse.status));
+                        }
+
+                        return retryResponse.json();
+                    }
+                } catch (e) {
+                    console.error("Auto-refresh failed", e);
+                }
+            }
+
+            if (!response.ok) {
+                const errorData: any = await response.json().catch(() => ({ detail: 'Unknown error' }));
+                const message = this.extractErrorMessage(errorData, response.status);
+
+                console.error('[API] Request failed:', { endpoint, status: response.status, message, data: errorData });
+                throw new Error(message);
+            }
+
+            return response.json();
+        } catch (err) {
+            throw err;
+        }
+    }
+
+    // Store tokens in memory for cross-site compatibility
+    private csrfToken: string | null = null;
+    private accessToken: string | null = null;
+
+    constructor() {
+        if (typeof window !== 'undefined') {
+            this.accessToken = localStorage.getItem('access_token');
+        }
+    }
+
+    getAccessToken(): string | null {
+        return this.accessToken;
+    }
+
+    async ensureCsrf() {
+        const response = await this.request<{ status: string; csrf_token?: string }>('/api/csrf/');
+        // Store the token from the response body
+        if (response.csrf_token) {
+            this.csrfToken = response.csrf_token;
+            console.log('[API] CSRF token received and stored:', this.csrfToken.substring(0, 10) + '...');
+        }
+        return response;
+    }
+
+    // Auth endpoints
+    async register(data: {
+        email: string;
+        username: string;
+        password: string;
+        full_name?: string;
+        company?: string;
+    }) {
+        console.log('[API] Registration attempt starting...');
+
+        // Ensure CSRF token before registration
+        if (!this.csrfToken) {
+            console.log('[API] Fetching CSRF token before registration...');
+            try {
+                await this.ensureCsrf();
+            } catch (e) {
+                console.warn('[API] CSRF fetch failed, continuing with cookie fallback');
+            }
+        }
+
+        const response = await this.request<{
+            access_token: string;
+            user: User;
+        }>('/api/auth/register/', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        });
+
+        if (response.access_token) {
+            this.accessToken = response.access_token;
+            if (typeof window !== 'undefined') {
+                localStorage.setItem('access_token', response.access_token);
+            }
+            console.log('[API] Registration successful, access token stored');
+        }
+        return response;
+    }
+
+    async login(email: string, password: string) {
+        console.log('[API] Login attempt starting...');
+
+        // Ensure CSRF token before login
+        if (!this.csrfToken) {
+            console.log('[API] Fetching CSRF token before login...');
+            try {
+                await this.ensureCsrf();
+            } catch (e) {
+                console.warn('[API] CSRF fetch failed, continuing with cookie fallback');
+            }
+        }
+
+        // Response contains token for backward compat, but cookies are set
+        const response = await this.request<{
+            access_token: string;
+            user: User;
+        }>('/api/auth/login/', {
+            method: 'POST',
+            body: JSON.stringify({ email, password }),
+        });
+
+        if (response.access_token) {
+            this.accessToken = response.access_token;
+            if (typeof window !== 'undefined') {
+                localStorage.setItem('access_token', response.access_token);
+            }
+            console.log('[API] Login successful, access token stored');
+        }
+        return response;
+    }
+
+    async logout() {
+        this.accessToken = null;
+        if (typeof window !== 'undefined') {
+            localStorage.removeItem('access_token');
+        }
+        return this.request<{ message: string }>('/api/auth/logout/', {
+            method: 'POST'
+        });
+    }
+
+    async getCurrentUser() {
+        return this.request<User>('/api/auth/me/');
+    }
+
+    async createScan(data: {
+        target_url: string;
+        target_name?: string;
+        scan_type?: string;
+        agents_enabled?: string[];
+        enable_waf_evasion?: boolean;
+        waf_evasion_consent?: boolean;
+        custom_headers?: Record<string, string>;
+        custom_cookies?: Record<string, string>;
+    }) {
+        return this.request<Scan>('/api/scans/', {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+    }
+
+    async getScans(page: number = 1, size: number = 20) {
+        return this.request<{
+            items: Scan[];
+            total: number;
+            page: number;
+            size: number;
+            pages: number;
+        }>(`/api/scans/?page=${page}&size=${size}`);
+    }
+
+    async getScan(scanId: number) {
+        return this.request<Scan>(`/api/scans/${scanId}/`);
+    }
+
+    async startScan(scanId: number) {
+        return this.request<Scan>(`/api/scans/${scanId}/start/`, {
+            method: 'POST',
+        });
+    }
+
+    async cancelScan(scanId: number) {
+        return this.request<Scan>(`/api/scans/${scanId}/cancel/`, {
+            method: 'POST',
+        });
+    }
+
+    async deleteScan(scanId: number) {
+        return this.request<void>(`/api/scans/${scanId}/`, {
+            method: 'DELETE',
+        });
+    }
+
+    // Vulnerability endpoints
+    async getVulnerabilities(scanId: number, page: number = 1, size: number = 50) {
+        return this.request<{
+            items: Vulnerability[];
+            total: number;
+            page: number;
+            size: number;
+        }>(`/api/vulnerabilities/?scan_id=${scanId}&page=${page}&size=${size}`);
+    }
+
+    async getVulnerabilitySummary(scanId: number) {
+        return this.request<{
+            total: number;
+            critical: number;
+            high: number;
+            medium: number;
+            low: number;
+            info: number;
+        }>(`/api/vulnerabilities/scan/${scanId}/summary/`);
+    }
+
+    async updateVulnerability(
+        vulnId: number,
+        data: {
+            is_false_positive?: boolean;
+            is_verified?: boolean;
+            is_fixed?: boolean;
+        }
+    ) {
+        return this.request<Vulnerability>(`/api/vulnerabilities/${vulnId}/`, {
+            method: 'PATCH',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async getVulnerabilityIntelligence(vulnId: number) {
+        return this.request<any>(`/api/vulnerabilities/${vulnId}/intelligence/`);
+    }
+
+    // Chat endpoint
+    async chat(message: string, scanId?: number) {
+        return this.request<{
+            response: string;
+            metadata?: any;
+            suggested_questions: string[];
+        }>('/api/chat/', {
+            method: 'POST',
+            body: JSON.stringify({ message, scan_id: scanId }),
+        });
+    }
+
+    async resetChat() {
+        return this.request<{ status: string }>('/api/chat/reset/', {
+            method: 'POST',
+        });
+    }
+
+    async chatAboutArtifact(scanId: string | number, artifactId: string, message: string, history: any[]) {
+        return this.request<{
+            response: string;
+            metadata?: any;
+            suggested_fix?: string;
+        }>('/api/chat/artifact', {
+            method: 'POST',
+            body: JSON.stringify({
+                scan_id: typeof scanId === 'string' ? parseInt(scanId) : scanId,
+                artifact_id: artifactId,
+                message,
+                history
+            }),
+        });
+    }
+
+    // Forensics & Self-Healing
+    async selfHealArtifact(scanId: string, artifactId: string, custom_fix_content?: string) {
+        return this.request<any>(`/api/forensics/${scanId}/artifacts/${artifactId}/self-heal/`, {
+            method: 'POST',
+            body: custom_fix_content ? JSON.stringify({ custom_fix_content }) : undefined,
+        });
+    }
+
+    async reportIssue(scanId: string, artifactId: string) {
+        return this.request<any>(`/api/forensics/${scanId}/artifacts/${artifactId}/report-issue/`, {
+            method: 'POST',
+        });
+    }
+
+    // ==================== GitHub Token Management ====================
+
+    async saveGitHubToken(token: string): Promise<{ message: string; username: string; configured: boolean }> {
+        return this.request('/api/auth/settings/github-token/', {
+            method: 'POST',
+            body: JSON.stringify({ token }),
+        });
+    }
+
+    async getGitHubTokenStatus(): Promise<{ configured: boolean; username?: string; valid: boolean; last_validated?: string }> {
+        return this.request('/api/auth/settings/github-token/status/');
+    }
+
+    async deleteGitHubToken(): Promise<{ message: string }> {
+        return this.request('/api/auth/settings/github-token/', {
+            method: 'DELETE',
+        });
+    }
+
+    // ==================== Exploit Sandbox ====================
+
+    async startExploitSandbox(vulnerabilityType: string, vulnerabilityId?: string): Promise<any> {
+        return this.request<any>('/api/exploit/start', {
+            method: 'POST',
+            body: JSON.stringify({
+                vulnerability_type: vulnerabilityType,
+                vulnerability_id: vulnerabilityId
+            })
+        });
+    }
+
+    async stopExploitSandbox(containerId: string): Promise<any> {
+        return this.request<any>(`/api/exploit/stop/${containerId}`, {
+            method: 'POST'
+        });
+    }
+
+    async executeExploitCommand(containerId: string, command: string): Promise<any> {
+        return this.request<any>('/api/exploit/command', {
+            method: 'POST',
+            body: JSON.stringify({ container_id: containerId, command })
+        });
+    }
+
+    async sendHeartbeat(containerId: string) {
+        // Fire and forget, no error throwing to avoid cluttering logs
+        // Using this.request for consistency with other API calls
+        return this.request<void>(`/api/exploit/heartbeat/${containerId}`, {
+            method: 'POST',
+        }).catch(() => { });
+    }
+
+    async getMarketplaceDashboard(): Promise<any> {
+        return this.request<any>('/api/marketplace/dashboard');
+    }
+
+    async getMarketplaceAll(limit: number = 50, offset: number = 0, scanId?: number | string): Promise<any[]> {
+        const params = new URLSearchParams({
+            limit: limit.toString(),
+            offset: offset.toString()
+        });
+        if (scanId) {
+            params.append('scan_id', scanId.toString());
+        }
+        return this.request<any[]>(`/api/marketplace/all?${params.toString()}`);
+    }
+
+    async getMarketplaceDetails(id: number | string): Promise<any> {
+        return this.request<any>(`/api/marketplace/vulnerability/${id}/details`);
+    }
+
+    async getMarketplaceExplanation(id: number | string): Promise<{ explanation: string }> {
+        return this.request<{ explanation: string }>(`/api/marketplace/vulnerability/${id}/explain`);
+    }
+
+    async getScanExplanation(scanId: number | string): Promise<{ explanation: string }> {
+        return this.request<{ explanation: string }>(`/api/marketplace/scan/${scanId}/explain`);
+    }
+
+    async checkDockerStatus(): Promise<any> {
+        return this.request<any>('/api/exploit/check-docker/');
+    }
+
+    async explainExploitCommand(command: string, context: string): Promise<{ explanation: string; breakdown?: string }> {
+        return this.request<{ explanation: string; breakdown?: string }>('/api/exploit/explain', {
+            method: 'POST',
+            body: JSON.stringify({ command, context })
+        });
+    }
+
+    async explainExploitCommandV2(cmd: string): Promise<{ explanation: string }> {
+        return this.request('/api/exploit/explain', {
+            method: 'POST',
+            body: JSON.stringify({ command: cmd }),
+        });
+    }
+
+    async explainExploitOutput(output: string, context: 'terminal' | 'browser', command?: string): Promise<{ explanation: string }> {
+        return this.request('/api/exploit/explain-output', {
+            method: 'POST',
+            body: JSON.stringify({ output, context, command }),
+        });
+    }
+
+    // ==================== GitHub Token Management ====================
+
+    async validateGitHubToken(): Promise<{ valid: boolean; username?: string; message: string }> {
+        return this.request('/api/auth/settings/github-token/validate/', {
+            method: 'POST',
+        });
+    }
+}
+
+// Types
+export interface User {
+    id: number;
+    email: string;
+    username: string;
+    full_name?: string;
+    company?: string;
+    is_active: boolean;
+    is_verified: boolean;
+    created_at: string;
+}
+
+export interface Scan {
+    id: number;
+    target_url: string;
+    target_name?: string;
+    scan_type: string;
+    status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+    progress: number;
+    total_vulnerabilities: number;
+    critical_count: number;
+    high_count: number;
+    medium_count: number;
+    low_count: number;
+    info_count: number;
+    technology_stack: string[];
+    agents_enabled: string[];
+    scanned_files?: string[];
+    enable_waf_evasion: boolean;
+    waf_evasion_consent: boolean;
+    custom_headers: Record<string, string> | null;
+    custom_cookies: Record<string, string> | null;
+    error_message?: string;
+    created_at: string;
+    started_at?: string;
+    completed_at?: string;
+}
+
+export interface Vulnerability {
+    id: number;
+    vulnerability_type: string;
+    severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+    cvss_score?: number;
+    url: string;
+    file_path?: string;
+    parameter?: string;
+    method: string;
+    title: string;
+    description: string;
+    evidence?: string;
+    ai_confidence: number;
+    ai_analysis?: string;
+    remediation?: string;
+    remediation_code?: string;
+    reference_links: string[];
+    owasp_category?: string;
+    cwe_id?: string;
+    is_false_positive: boolean;
+    is_verified: boolean;
+    is_fixed: boolean;
+    is_suppressed: boolean;
+    suppression_reason?: string;
+    marketplace_value_avg?: number;
+    marketplace_last_analyzed?: string;
+
+    // Final Verdict Layer
+    final_verdict?: string;
+    action_required: boolean;
+    detection_confidence: number;
+    exploit_confidence: number;
+
+    // Scope & Impact
+    scope_impact?: {
+        affected_endpoints: number;
+        affected_methods: string[];
+        is_systemic: boolean;
+        summary: string;
+        description?: string;
+    };
+
+    threat_intelligence?: {
+        trend_score: number;
+        avg_cvss: number;
+        actively_exploited: boolean;
+        activity_level: string;
+        disclosure_count_30d: number;
+        attack_summary: string;
+        why_trending: string;
+        real_world_exploit_flow: string[];
+        business_impact: string;
+        technical_impact: string;
+        data_sources: string[];
+    };
+
+    detected_by?: string;
+    detected_at: string;
+    scan_id: number;
+}
+
+
+
+// Export singleton instance
+export const api: MatrixApiClient = new MatrixApiClient();
